@@ -8,6 +8,8 @@ server.py - 教学实验 WebSocket 服务
 import asyncio  # 异步服务能力，用于同时处理编辑器连接和节点热重载
 import json  # 标准信封编码能力，用于浏览器与后端通信
 import logging  # 日志过滤能力，用于忽略握手前断开的端口探测
+import os  # 进程能力，用于第二次 Ctrl+C 时强制退出
+import signal  # 信号能力，用于响应 Ctrl+C 和终止信号
 
 import websockets  # WebSocket服务能力，用于实时反馈逐节点结果
 from websockets.exceptions import InvalidMessage  # 握手异常类型，用于精准过滤无请求探测
@@ -59,6 +61,11 @@ def getErrorData(error, code="requestFailed"):
     return {"code": code, "message": str(error), "details": {}}  # 未分类错误使用统一结构
 
 
+# --- 读取连接的模型缓存槽位 ---
+def getCacheId(ws):
+    return getattr(ws, "id", None)  # websockets为每个连接分配唯一id；测试用的假连接没有id时共用默认槽位
+
+
 # --- 读取并校验请求data ---
 def getRequestData(requestData):
     messageData = requestData.get("data")  # 所有业务参数位于固定data字段
@@ -94,7 +101,7 @@ async def handleMessage(ws, message):
 
     try:
         if messageType == "getRegistry":
-            await sendMessage(ws, "getRegistry", messageId, registry.getAllForFrontend())  # 返回当前教学节点定义
+            await sendMessage(ws, "getRegistry", messageId, registry.getPublishedForFrontend())  # 返回完整注册表快照，计算线程热重载期间也不会读到半成品
             return
 
         messageData = getRequestData(requestData)  # 业务消息必须携带对象data
@@ -107,19 +114,24 @@ async def handleMessage(ws, message):
             async def onNodeError(nodeId, nodeError):
                 await sendError(ws, "nodeError", messageId, {"nodeId": nodeId, **nodeError})  # 错误直接关联画布节点
 
-            result = await engine.run(blueprint, onNodeResult, onNodeError, messageData.get("inputs"), messageData.get("maxValues", 65536))  # InputNode缺省生成指定形状随机张量
+            result = await engine.run(blueprint, onNodeResult, onNodeError, messageData.get("inputs"), messageData.get("maxValues", 65536), cacheId=getCacheId(ws))  # InputNode缺省生成指定形状随机张量
             await sendMessage(ws, "blueprintComplete", messageId, result)  # 整张蓝图只发送一次终态
             return
 
         if messageType == "trainStep":
             blueprint = getBlueprint(messageData)  # 单步训练使用当前完整蓝图
-            model = engine.compileBlueprintCached(blueprint)  # 蓝图不变时保留权重和优化器状态
-            result = model.trainStep(messageData.get("maxValues", 65536), messageData.get("optimizer", "sgd"), messageData.get("learningRate", 0.01), messageData.get("gradientClip", 0.0))  # 使用用户超参数执行一次前向、反向和权重更新
+            cacheId = getCacheId(ws)  # 每个连接独立训练，互不覆盖
+
+            def trainSync():
+                model = engine.compileBlueprintCached(blueprint, cacheId)  # 同一连接蓝图不变时保留权重和优化器状态
+                return model.trainStep(messageData.get("maxValues", 65536), messageData.get("optimizer", "sgd"), messageData.get("learningRate", 0.01), messageData.get("gradientClip", 0.0))  # 使用用户超参数执行一次前向、反向和权重更新
+
+            result = await engine.runInWorker(trainSync)  # 编译和训练在计算线程执行，事件循环继续响应其他请求
             await sendMessage(ws, "trainStep", messageId, result)  # 返回loss、预测值、目标值和节点训练快照
             return
 
         if messageType == "resetTraining":
-            engine.clearModelCache()  # 丢弃权重和优化器状态，下次训练重新按节点ID初始化
+            await engine.runInWorker(engine.clearModelCache, getCacheId(ws), allSlots=False)  # 只重置当前连接；排在已提交的计算之后，避免与在途训练交错
             await sendMessage(ws, "resetTraining", messageId, {"status": "reset"})  # 告知前端训练已经回到初始状态
             return
 
@@ -143,18 +155,59 @@ async def handleConnection(ws):
         print(f"连接结束: {error}")  # 记录真实连接协议或网络异常
     finally:
         clients.discard(ws)  # 无论何种原因都释放连接
+        try:
+            await engine.runInWorker(engine.clearModelCache, getCacheId(ws), allSlots=False)  # 释放该连接的模型；排在它的在途计算之后，不会被重新写回
+        except Exception:
+            pass  # 服务关闭时计算线程已停止，进程退出会一并释放
         print(f"前端已断开，当前连接数: {len(clients)}")  # 记录连接收口
+
+
+# --- 安装 Ctrl+C 和终止信号处理 ---
+def installStopHandlers(loop, stopSignal):
+    def onStopSignal():
+        if stopSignal.is_set():
+            print("再次收到退出信号，强制退出")  # 单个超大算子迟迟不结束时给用户留出口
+            os._exit(1)  # 不再等待计算线程
+        stopSignal.set()  # 第一次信号只通知主流程开始优雅关闭
+
+    for signalNumber in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signalNumber, onStopSignal)  # Unix 事件循环原生支持
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                signal.signal(signalNumber, lambda *_: loop.call_soon_threadsafe(onStopSignal))  # Windows 事件循环不支持时退回标准信号处理
+            except ValueError:
+                print("当前不在主线程，无法安装 Ctrl+C 处理，服务仍会正常运行")  # 被嵌入到其他程序的线程里运行时不让服务启动失败
+                return
+
+
+# --- 运行服务直到收到退出信号 ---
+async def serve(host="127.0.0.1", port=8765):
+    loop = asyncio.get_running_loop()  # 信号和热重载都挂在当前事件循环
+    stopSignal = asyncio.Event()  # Ctrl+C 或 SIGTERM 触发
+    installStopHandlers(loop, stopSignal)
+    registry.publishedFrontend = registry.getAllForFrontend()  # 启动时先发布完整注册表，此后getRegistry只读快照，第一次热重载也不会读到半成品
+    async with websockets.serve(handleConnection, host, port) as service:
+        boundPort = service.sockets[0].getsockname()[1]  # port=0 时读取系统实际分配的端口
+        print(f"WebSocket服务已启动: ws://{host}:{boundPort}（按 Ctrl+C 退出）")  # 握手监听成功
+        import plugin_hot_reload  # 节点文件热重载作为可拔插开发能力
+        hotReloadTask = plugin_hot_reload.mountHotReload(loop, broadcast)  # 节点变化后广播新注册表
+        await stopSignal.wait()  # 保持服务常驻，直到收到退出信号
+
+        print("收到退出信号，正在停止计算线程...（再次按 Ctrl+C 强制退出）")
+        engine.requestStop()  # 正在执行的计算在下一个节点检查点中止，并照常给前端发送终态
+        hotReloadTask.cancel()  # 停止监听节点文件
+        await asyncio.gather(hotReloadTask, return_exceptions=True)  # 等待监听任务真正结束
+        await asyncio.to_thread(engine.computeExecutor.shutdown, wait=True)  # 等待当前和排队任务退出：它们会在第一个检查点以serverStopping结束并照常发送终态；不能取消排队任务，否则等待它的连接收不到终态、也不会被关闭
+
+        print(f"计算线程已停止，正在关闭 {len(clients)} 个连接...")
+    print("后端已退出")  # 离开 async with 时服务端以 1001 关闭全部连接并释放端口
 
 
 # --- 启动本地实验服务 ---
 def start(host="127.0.0.1", port=8765):
     print(f"WebSocket服务启动中... ws://{host}:{port}")  # 默认仅监听本机，避免实验接口暴露到局域网
-
-    async def main():
-        async with websockets.serve(handleConnection, host, port):
-            print(f"WebSocket服务已启动: ws://{host}:{port}")  # 握手监听成功
-            import plugin_hot_reload  # 节点文件热重载作为可拔插开发能力
-            plugin_hot_reload.mountHotReload(asyncio.get_running_loop(), broadcast)  # 节点变化后广播新注册表
-            await asyncio.Future()  # 保持服务常驻
-
-    asyncio.run(main())  # 启动异步事件循环
+    try:
+        asyncio.run(serve(host, port))  # 启动异步事件循环，收到退出信号后正常返回
+    except KeyboardInterrupt:
+        print("后端已退出")  # 信号处理器安装前就按下 Ctrl+C 时安静退出
